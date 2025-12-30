@@ -155,7 +155,7 @@ add_node() {
     "
     REMOTE_DATA=$(ssh -o StrictHostKeyChecking=no $REMOTE_USER_HOST "$DATA_CMD")
 
-    # FIXED PARSING logic for IPv6
+    # IPv6 Safe Parsing
     PUB=$(echo "$REMOTE_DATA" | grep "MATCH_PUB:" | sed 's/^MATCH_PUB://' | tr -d '\r')
     DETECTED_IP=$(echo "$REMOTE_DATA" | grep "MATCH_IP:" | sed 's/^MATCH_IP://' | tr -d '\r')
     ENDPOINT=${MANUAL_ENDPOINT:-$DETECTED_IP}
@@ -299,7 +299,13 @@ PrivateKey = \$CUR_KEY
 SaveConfig = false
 $PEER_BLOCKS
 EOF_CONF
-                systemctl enable wg-quick@wg0; wg syncconf wg0 <(wg-quick strip wg0)
+                # START OR SYNC LOGIC
+                systemctl enable wg-quick@wg0
+                if systemctl is-active --quiet wg-quick@wg0; then
+                    wg syncconf wg0 <(wg-quick strip wg0)
+                else
+                    systemctl start wg-quick@wg0
+                fi
             "
         fi
     done
@@ -354,8 +360,16 @@ list_peers() {
     echo "-----------------------------------------------------------------------------"
     DUMP=$(wg show $WG_IFACE dump)
     NOW=$(date +%s)
-    sqlite3 -separator "|" "$DB_FILE" "SELECT hostname, vpn_ip, endpoint_ip, public_key, peer_type FROM peers" | while read -r line; do
-        IFS='|' read -r NAME VPN REAL PUB TYPE <<< "$line"
+    # Added is_manager to selection
+    sqlite3 -separator "|" "$DB_FILE" "SELECT hostname, vpn_ip, endpoint_ip, public_key, peer_type, is_manager FROM peers" | while read -r line; do
+        IFS='|' read -r NAME VPN REAL PUB TYPE MGR <<< "$line"
+
+        # Display Manager clearly
+        if [ "$MGR" == "1" ]; then
+            printf "%-15s %-15s %-15s %-10s %-10s %-10s\n" "$NAME" "$VPN" "$REAL" "OWNER" "ONLINE" "-"
+            continue
+        fi
+
         STATS=$(echo "$DUMP" | grep "$PUB")
         STATUS="${RED}OFFLINE${NC}"; SEEN="-"
         if [ ! -z "$STATS" ]; then
