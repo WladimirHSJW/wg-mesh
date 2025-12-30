@@ -3,7 +3,7 @@
 # ==========================================
 # CONFIGURATION
 # ==========================================
-# DETECT BOTH IPV4 AND IPV6 TO PREVENT LOCKOUTS
+# Detect IPs at runtime for firewall whitelisting
 MGMT_IPV4=$(curl -4 -s ifconfig.me)
 MGMT_IPV6=$(curl -6 -s ifconfig.me)
 
@@ -78,7 +78,7 @@ init_manager() {
     ufw allow in on ${WG_IFACE}
     echo "y" | ufw enable
 
-    # Prefer IPv4 for the database endpoint if available, else IPv6
+    # Prefer IPv4 for the database endpoint if available
     MGMT_ENDPOINT=${MGMT_IPV4:-$MGMT_IPV6}
 
     sqlite3 "$DB_FILE" "INSERT INTO peers (hostname, vpn_ip, public_key, endpoint_ip, listen_port, peer_type, is_manager)
@@ -119,7 +119,7 @@ add_node() {
 
     echo -e "${BLUE}Step 1/3: Installing & Securing $NODE_NAME...${NC}"
 
-    # Build the Firewall Rule String dynamically based on what IPs we detected
+    # Build Firewall Rules
     FW_RULES=""
     if [ -n "$MGMT_IPV4" ]; then FW_RULES+="ufw allow from $MGMT_IPV4 to any port 22 proto tcp;"; fi
     if [ -n "$MGMT_IPV6" ]; then FW_RULES+="ufw allow from $MGMT_IPV6 to any port 22 proto tcp;"; fi
@@ -131,10 +131,7 @@ add_node() {
         ufw --force reset
         ufw default deny incoming
         ufw default allow outgoing
-
-        # Apply generated rules for Manager Access
         $FW_RULES
-
         ufw allow 80/tcp
         ufw allow 443/tcp
         ufw allow ${DEFAULT_PORT}/udp
@@ -142,26 +139,25 @@ add_node() {
         echo 'y' | ufw enable
     "
     ssh -o StrictHostKeyChecking=no $REMOTE_USER_HOST "$SETUP_CMD"
-    if [ $? -ne 0 ]; then echo -e "${RED}Installation/Firewall setup failed.${NC}"; exit 1; fi
+    if [ $? -ne 0 ]; then echo -e "${RED}Installation failed.${NC}"; exit 1; fi
 
     # 2. GENERATE KEYS
     echo -e "${BLUE}Step 2/3: Generating keys...${NC}"
     DATA_CMD="
         PRIV=\$(wg genkey)
         PUB=\$(echo \"\$PRIV\" | wg pubkey)
-
         mkdir -p /etc/wireguard
         echo \"[Interface]\" > /etc/wireguard/wg0.conf
         echo \"PrivateKey = \$PRIV\" >> /etc/wireguard/wg0.conf
         chmod 600 /etc/wireguard/wg0.conf
-
         echo \"MATCH_PUB:\$PUB\"
         echo \"MATCH_IP:\$(curl -s ifconfig.me)\"
     "
     REMOTE_DATA=$(ssh -o StrictHostKeyChecking=no $REMOTE_USER_HOST "$DATA_CMD")
 
-    PUB=$(echo "$REMOTE_DATA" | grep "MATCH_PUB:" | cut -d':' -f2 | tr -d '\r')
-    DETECTED_IP=$(echo "$REMOTE_DATA" | grep "MATCH_IP:" | cut -d':' -f2 | tr -d '\r')
+    # FIXED PARSING logic for IPv6
+    PUB=$(echo "$REMOTE_DATA" | grep "MATCH_PUB:" | sed 's/^MATCH_PUB://' | tr -d '\r')
+    DETECTED_IP=$(echo "$REMOTE_DATA" | grep "MATCH_IP:" | sed 's/^MATCH_IP://' | tr -d '\r')
     ENDPOINT=${MANUAL_ENDPOINT:-$DETECTED_IP}
 
     if [[ -z "$PUB" ]]; then
@@ -214,6 +210,9 @@ export_client() {
     MGR_DATA=$(sqlite3 -separator "|" "$DB_FILE" "SELECT public_key, endpoint_ip, listen_port FROM peers WHERE is_manager=1")
     IFS='|' read -r M_PUB M_IP M_PORT <<< "$MGR_DATA"
 
+    # Wrap Manager IP in brackets if IPv6
+    if [[ "$M_IP" == *":"* ]]; then M_EP="[$M_IP]:$M_PORT"; else M_EP="$M_IP:$M_PORT"; fi
+
     echo ""
     echo -e "${GREEN}### COPY BELOW FOR WIREGUARD CLIENT ($CLIENT_NAME) ###${NC}"
     echo "---------------------------------------------------------"
@@ -225,7 +224,7 @@ export_client() {
     echo "[Peer]"
     echo "# Manager connection"
     echo "PublicKey = $M_PUB"
-    echo "Endpoint = $M_IP:$M_PORT"
+    echo "Endpoint = $M_EP"
     echo "AllowedIPs = ${VPN_SUBNET}.0/24"
     echo "PersistentKeepalive = 25"
     echo "---------------------------------------------------------"
@@ -270,7 +269,10 @@ sync_mesh() {
             if [ "$O_TYPE" == "client" ]; then
                 BLOCK=$(printf "[Peer]\n# Client: Peer_%s\nPublicKey = %s\nAllowedIPs = %s/32\n" "$O_ID" "$O_PUB" "$O_VPN")
             else
-                BLOCK=$(printf "[Peer]\n# Server: Peer_%s\nPublicKey = %s\nEndpoint = %s:%s\nAllowedIPs = %s/32\nPersistentKeepalive = 25\n" "$O_ID" "$O_PUB" "$O_REAL" "$O_PORT" "$O_VPN")
+                # IPv6 WRAPPING LOGIC FOR ENDPOINTS
+                if [[ "$O_REAL" == *":"* ]]; then EP="[$O_REAL]:$O_PORT"; else EP="$O_REAL:$O_PORT"; fi
+
+                BLOCK=$(printf "[Peer]\n# Server: Peer_%s\nPublicKey = %s\nEndpoint = %s\nAllowedIPs = %s/32\nPersistentKeepalive = 25\n" "$O_ID" "$O_PUB" "$EP" "$O_VPN")
             fi
             PEER_BLOCKS="${PEER_BLOCKS}${BLOCK}"
         done
