@@ -28,7 +28,7 @@ ensure_deps() {
         echo -e "${YELLOW}Installing dependencies...${NC}"
         apt-get update && apt-get install -y wireguard sqlite3 bc ufw curl
     fi
-    # ENABLE IP FORWARDING (Required for Split Tunneling to reach other nodes/containers)
+    # ENABLE IP FORWARDING
     if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf; then
         echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
         sysctl -p
@@ -94,19 +94,14 @@ Address = ${VPN_SUBNET}.1/24
 ListenPort = ${DEFAULT_PORT}
 PrivateKey = ${PRIV_KEY}
 SaveConfig = false
-
-# 1. Allow VPN traffic to flow
+# Docker & Routing Fixes
 PostUp = ufw route allow in on $WG_IFACE out on eth0
-
-# 2. DOCKER COMPATIBILITY (The "Fix")
-# This Masquerades traffic coming FROM the VPN so Docker containers know where to reply.
-# It does NOT route your internet traffic, only VPN traffic accessing the server.
 PostUp = iptables -t nat -A POSTROUTING -s ${VPN_SUBNET}.0/24 -j MASQUERADE
 PostDown = iptables -t nat -D POSTROUTING -s ${VPN_SUBNET}.0/24 -j MASQUERADE
 EOF
 
     systemctl enable wg-quick@$WG_IFACE
-    systemctl start wg-quick@$WG_IFACE
+    systemctl restart wg-quick@$WG_IFACE
     echo -e "${GREEN}Manager Initialized.${NC}"
 }
 
@@ -148,7 +143,6 @@ add_node() {
         ufw allow ${DEFAULT_PORT}/udp
         ufw allow in on ${WG_IFACE}
         echo 'y' | ufw enable
-        # Forwarding needed for mesh routing
         if ! grep -q 'net.ipv4.ip_forward=1' /etc/sysctl.conf; then echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf; sysctl -p; fi
     "
     ssh -o StrictHostKeyChecking=no $REMOTE_USER_HOST "$SETUP_CMD"
@@ -202,7 +196,7 @@ add_client() {
     sqlite3 "$DB_FILE" "INSERT INTO peers (hostname, vpn_ip, public_key, private_key, endpoint_ip, listen_port, peer_type, is_manager)
         VALUES ('$CLIENT_NAME', '$CLIENT_IP', '$PUB_KEY', '$PRIV_KEY', 'dynamic', 0, 'client', 0);"
 
-    sync_mesh
+    sync_mesh > /dev/null 2>&1
     export_client "$CLIENT_NAME"
 }
 
@@ -217,7 +211,7 @@ export_client() {
     MGR_DATA=$(sqlite3 -separator "|" "$DB_FILE" "SELECT public_key, endpoint_ip, listen_port FROM peers WHERE is_manager=1")
     IFS='|' read -r M_PUB M_IP M_PORT <<< "$MGR_DATA"
 
-    # FORCE IPV4 DETECTION
+    # FORCE IPV4 DETECTION FOR CLIENTS
     CURRENT_V4=$(curl -4 -s ifconfig.me)
     if [ -n "$CURRENT_V4" ]; then M_EP="$CURRENT_V4:$M_PORT"; else
         DB_EP=$(sqlite3 "$DB_FILE" "SELECT endpoint_ip FROM peers WHERE is_manager=1")
@@ -236,7 +230,7 @@ export_client() {
     echo "# Manager connection"
     echo "PublicKey = $M_PUB"
     echo "Endpoint = $M_EP"
-    # STRICT SPLIT TUNNELING: Only traffic for 10.10.0.x goes through VPN
+    # STRICT SPLIT TUNNELING
     echo "AllowedIPs = ${VPN_SUBNET}.0/24"
     echo "PersistentKeepalive = 25"
     echo "---------------------------------------------------------"
@@ -244,14 +238,13 @@ export_client() {
 }
 
 # ==========================================
-# SYNC MESH
+# SYNC MESH (FORCE RESTART)
 # ==========================================
 sync_mesh() {
     echo -e "${GREEN}Syncing Mesh...${NC}"
     SERVER_IDS=$(sqlite3 "$DB_FILE" "SELECT id FROM peers WHERE peer_type='server';")
 
-    # CLEANER RULES FOR SPLIT TUNNEL + DOCKER SUPPORT
-    # We masquerade VPN traffic so Docker accepts it.
+    # RULES FOR SPLIT TUNNEL + DOCKER
     RULES_UP="PostUp = iptables -t nat -A POSTROUTING -s ${VPN_SUBNET}.0/24 -j MASQUERADE"
     RULES_DOWN="PostDown = iptables -t nat -D POSTROUTING -s ${VPN_SUBNET}.0/24 -j MASQUERADE"
 
@@ -277,14 +270,16 @@ sync_mesh() {
         if [ "$T_NAME" == "manager" ]; then
             CUR_KEY=$(grep "PrivateKey" $CONFIG_DIR/$WG_IFACE.conf | awk '{print $3}')
             echo -e "${CONFIG_CONTENT/PRIV_KEY_PLACEHOLDER/$CUR_KEY}" > "$CONFIG_DIR/$WG_IFACE.conf"
-            wg syncconf $WG_IFACE <(wg-quick strip $WG_IFACE)
+            # FORCE RESTART LOCAL
+            systemctl restart wg-quick@$WG_IFACE
         else
             REMOTE_CONFIG="${CONFIG_CONTENT//\\n/\\\\n}"
             ssh -o StrictHostKeyChecking=no root@$T_REAL "
                 CUR_KEY=\$(grep 'PrivateKey' /etc/wireguard/wg0.conf | awk '{print \$3}')
                 echo -e \"${REMOTE_CONFIG/PRIV_KEY_PLACEHOLDER/\$CUR_KEY}\" > /etc/wireguard/wg0.conf
                 systemctl enable wg-quick@wg0
-                if systemctl is-active --quiet wg-quick@wg0; then wg syncconf wg0 <(wg-quick strip wg0); else systemctl start wg-quick@wg0; fi
+                # FORCE RESTART REMOTE
+                systemctl restart wg-quick@wg0
             "
         fi
     done
