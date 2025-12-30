@@ -136,6 +136,11 @@ add_node() {
     DETECTED_IP=$(echo "$REMOTE_DATA" | tail -n 1)
     ENDPOINT=${MANUAL_ENDPOINT:-$DETECTED_IP}
 
+    if [[ -z "$PUB" ]]; then
+        echo -e "${RED}Failed to extract public key from remote.${NC}"
+        exit 1
+    fi
+
     sqlite3 "$DB_FILE" "INSERT INTO peers (hostname, vpn_ip, public_key, endpoint_ip, listen_port, peer_type, is_manager)
         VALUES ('$NODE_NAME', '$NODE_VPN_IP', '$PUB', '$ENDPOINT', ${DEFAULT_PORT}, 'server', 0);"
 
@@ -164,8 +169,7 @@ add_client() {
     sqlite3 "$DB_FILE" "INSERT INTO peers (hostname, vpn_ip, public_key, private_key, endpoint_ip, listen_port, peer_type, is_manager)
         VALUES ('$CLIENT_NAME', '$CLIENT_IP', '$PUB_KEY', '$PRIV_KEY', 'dynamic', 0, 'client', 0);"
 
-    # Sync so servers know about the client
-    sync_mesh > /dev/null 2>&1
+    sync_mesh > /dev/null 2>&1 # Sync in background to not block output
 
     export_client "$CLIENT_NAME"
 }
@@ -175,15 +179,12 @@ export_client() {
     if [[ -z "$CLIENT_NAME" ]]; then echo "Usage: $0 export <name>"; exit 1; fi
 
     DATA=$(sqlite3 -separator "|" "$DB_FILE" "SELECT private_key, vpn_ip FROM peers WHERE hostname='$CLIENT_NAME'")
-    if [[ -z "$DATA" ]]; then echo "Client not found."; exit 1; fi
+    if [[ -z "$DATA" ]]; then echo "Client '$CLIENT_NAME' not found."; exit 1; fi
 
-    PRIV=$(echo "$DATA" | cut -d'|' -f1)
-    IP=$(echo "$DATA" | cut -d'|' -f2)
+    IFS='|' read -r PRIV IP <<< "$DATA"
 
     MGR_DATA=$(sqlite3 -separator "|" "$DB_FILE" "SELECT public_key, endpoint_ip, listen_port FROM peers WHERE is_manager=1")
-    M_PUB=$(echo "$MGR_DATA" | cut -d'|' -f1)
-    M_IP=$(echo "$MGR_DATA" | cut -d'|' -f2)
-    M_PORT=$(echo "$MGR_DATA" | cut -d'|' -f3)
+    IFS='|' read -r M_PUB M_IP M_PORT <<< "$MGR_DATA"
 
     echo ""
     echo -e "${GREEN}### COPY BELOW FOR WIREGUARD CLIENT ($CLIENT_NAME) ###${NC}"
@@ -194,7 +195,7 @@ export_client() {
     echo "DNS = 1.1.1.1"
     echo ""
     echo "[Peer]"
-    echo "# Manager"
+    echo "# Manager connection (for access to the whole mesh)"
     echo "PublicKey = $M_PUB"
     echo "Endpoint = $M_IP:$M_PORT"
     echo "AllowedIPs = ${VPN_SUBNET}.0/24"
@@ -219,8 +220,7 @@ remove_peer() {
         exit 1
     fi
 
-    TYPE=$(echo "$PEER_DATA" | cut -d'|' -f1)
-    IS_MGR=$(echo "$PEER_DATA" | cut -d'|' -f2)
+    IFS='|' read -r TYPE IS_MGR <<< "$PEER_DATA"
 
     if [ "$IS_MGR" == "1" ]; then
         echo -e "${RED}Error: Cannot remove the Manager node.${NC}"
@@ -246,39 +246,21 @@ sync_mesh() {
     SERVER_IDS=$(sqlite3 "$DB_FILE" "SELECT id FROM peers WHERE peer_type='server';")
 
     for ID in $SERVER_IDS; do
-        DATA=$(sqlite3 -separator "|" "$DB_FILE" "SELECT hostname, vpn_ip, endpoint_ip, is_manager FROM peers WHERE id=$ID")
-        T_NAME=$(echo "$DATA" | cut -d'|' -f1)
-        T_VPN=$(echo "$DATA" | cut -d'|' -f2)
-        T_REAL=$(echo "$DATA" | cut -d'|' -f3)
-        T_MGR=$(echo "$DATA" | cut -d'|' -f4)
+        IFS='|' read -r T_NAME T_VPN T_REAL T_MGR <<< $(sqlite3 -separator "|" "$DB_FILE" "SELECT hostname, vpn_ip, endpoint_ip, is_manager FROM peers WHERE id=$ID")
 
         PEER_BLOCKS=""
         OTHER_IDS=$(sqlite3 "$DB_FILE" "SELECT id FROM peers WHERE id != $ID;")
         for O_ID in $OTHER_IDS; do
-            DATA=$(sqlite3 -separator "|" "$DB_FILE" "SELECT public_key, vpn_ip, endpoint_ip, listen_port, peer_type FROM peers WHERE id=$O_ID")
-            O_PUB=$(echo "$DATA" | cut -d'|' -f1)
-            O_VPN=$(echo "$DATA" | cut -d'|' -f2)
-            O_REAL=$(echo "$DATA" | cut -d'|' -f3)
-            O_PORT=$(echo "$DATA" | cut -d'|' -f4)
-            O_TYPE=$(echo "$DATA" | cut -d'|' -f5)
+            IFS='|' read -r O_PUB O_VPN O_REAL O_PORT O_TYPE <<< $(sqlite3 -separator "|" "$DB_FILE" "SELECT public_key, vpn_ip, endpoint_ip, listen_port, peer_type FROM peers WHERE id=$O_ID")
 
             if [ "$O_TYPE" == "client" ]; then
-                BLOCK="[Peer]
-# Client: Peer_$O_ID
-PublicKey = $O_PUB
-AllowedIPs = $O_VPN/32
-"
+                BLOCK=$(printf "[Peer]\n# Client: Peer_%s\nPublicKey = %s\nAllowedIPs = %s/32\n" \
+                    "$O_ID" "$O_PUB" "$O_VPN")
             else
-                BLOCK="[Peer]
-# Server: Peer_$O_ID
-PublicKey = $O_PUB
-Endpoint = $O_REAL:$O_PORT
-AllowedIPs = $O_VPN/32
-PersistentKeepalive = 25
-"
+                BLOCK=$(printf "[Peer]\n# Server: Peer_%s\nPublicKey = %s\nEndpoint = %s:%s\nAllowedIPs = %s/32\nPersistentKeepalive = 25\n" \
+                    "$O_ID" "$O_PUB" "$O_REAL" "$O_PORT" "$O_VPN")
             fi
-            PEER_BLOCKS="$PEER_BLOCKS
-$BLOCK"
+            PEER_BLOCKS="${PEER_BLOCKS}${BLOCK}"
         done
 
         if [ "$T_NAME" == "manager" ]; then
@@ -341,7 +323,8 @@ upgrade_system() {
     TARGET=$1
     check_root
     if [ "$TARGET" == "all" ]; then
-        sqlite3 -separator "|" "$DB_FILE" "SELECT hostname, endpoint_ip, is_manager FROM peers WHERE peer_type='server'" | while IFS='|' read -r NAME REAL MGR; do
+        sqlite3 -separator "|" "$DB_FILE" "SELECT hostname, endpoint_ip, is_manager FROM peers WHERE peer_type='server'" | while read -r line; do
+            IFS='|' read -r NAME REAL MGR <<< "$line"
             read -p "Upgrade '$NAME'? (y/n/q): " -n 1 -r; echo
             if [[ $REPLY =~ ^[Qq]$ ]]; then exit 0; fi
             if [[ $REPLY =~ ^[Yy]$ ]]; then perform_upgrade "$NAME" "$REAL" "$MGR"; fi
@@ -349,9 +332,7 @@ upgrade_system() {
     else
         RAW=$(sqlite3 -separator "|" "$DB_FILE" "SELECT hostname, endpoint_ip, is_manager FROM peers WHERE hostname='$TARGET'")
         if [[ -z "$RAW" ]]; then echo "Node not found."; exit 1; fi
-        NAME=$(echo "$RAW" | cut -d'|' -f1)
-        REAL=$(echo "$RAW" | cut -d'|' -f2)
-        MGR=$(echo "$RAW" | cut -d'|' -f3)
+        IFS='|' read -r NAME REAL MGR <<< "$RAW"
         perform_upgrade "$NAME" "$REAL" "$MGR"
     fi
 }
@@ -364,16 +345,22 @@ list_peers() {
     echo "-----------------------------------------------------------------------------"
     DUMP=$(wg show $WG_IFACE dump)
     NOW=$(date +%s)
-    sqlite3 -separator "|" "$DB_FILE" "SELECT hostname, vpn_ip, endpoint_ip, public_key, peer_type FROM peers" | while IFS='|' read -r NAME VPN REAL PUB TYPE; do
+    sqlite3 -separator "|" "$DB_FILE" "SELECT hostname, vpn_ip, endpoint_ip, public_key, peer_type FROM peers" | while read -r line; do
+        IFS='|' read -r NAME VPN REAL PUB TYPE <<< "$line"
 
         STATS=$(echo "$DUMP" | grep "$PUB")
         STATUS="${RED}OFFLINE${NC}"; SEEN="-"
         if [ ! -z "$STATS" ]; then
             HS=$(echo "$STATS" | awk '{print $5}')
-            HS=${HS:-0}
-            if [ "$HS" -ne 0 ]; then
+            # --- FIX APPLIED HERE ---
+            # Check if HS is a number and not 0 before performing arithmetic
+            if [[ "$HS" =~ ^[0-9]+$ ]] && [ "$HS" -ne 0 ]; then
                 if [ $((NOW - HS)) -lt 180 ]; then STATUS="${GREEN}ONLINE${NC}"; else STATUS="${YELLOW}IDLE${NC}"; fi
                 SEEN=$(date -d @$HS "+%H:%M:%S")
+            else
+                # If handshake is 0 or invalid, it's offline/never connected
+                STATUS="${RED}OFFLINE${NC}"
+                SEEN="Never"
             fi
         fi
         printf "%-15s %-15s %-15s %-10s %-10b %-10s\n" "$NAME" "$VPN" "$REAL" "$TYPE" "$STATUS" "$SEEN"
@@ -385,7 +372,6 @@ case "$1" in
     add) add_node "$2" "$3" "$4" ;;
     add-client) add_client "$2" ;;
     export) export_client "$2" ;;
-    # 'remove' works for both clients and servers
     rm|remove|remove-client) remove_peer "$2" ;;
     upgrade) upgrade_system "$2" ;;
     sync) check_root; sync_mesh ;;
