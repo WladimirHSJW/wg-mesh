@@ -1,8 +1,3 @@
-Here is the updated `README.md` reflecting the latest features: **Client Management (Roaming)**, **SSH Hardening**, and
-**Direct Output** (no files/QR codes).
-
-***
-
 # WireGuard Mesh & Client Manager
 
 A production-ready Bash script to manage a **Secure Full Mesh VPN**.
