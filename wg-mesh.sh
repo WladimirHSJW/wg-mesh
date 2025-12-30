@@ -177,10 +177,13 @@ export_client() {
     DATA=$(sqlite3 -separator "|" "$DB_FILE" "SELECT private_key, vpn_ip FROM peers WHERE hostname='$CLIENT_NAME'")
     if [[ -z "$DATA" ]]; then echo "Client not found."; exit 1; fi
 
-    IFS='|' read -r PRIV IP <<< "$DATA"
+    PRIV=$(echo "$DATA" | cut -d'|' -f1)
+    IP=$(echo "$DATA" | cut -d'|' -f2)
 
     MGR_DATA=$(sqlite3 -separator "|" "$DB_FILE" "SELECT public_key, endpoint_ip, listen_port FROM peers WHERE is_manager=1")
-    IFS='|' read -r M_PUB M_IP M_PORT <<< "$MGR_DATA"
+    M_PUB=$(echo "$MGR_DATA" | cut -d'|' -f1)
+    M_IP=$(echo "$MGR_DATA" | cut -d'|' -f2)
+    M_PORT=$(echo "$MGR_DATA" | cut -d'|' -f3)
 
     echo ""
     echo -e "${GREEN}### COPY BELOW FOR WIREGUARD CLIENT ($CLIENT_NAME) ###${NC}"
@@ -216,7 +219,8 @@ remove_peer() {
         exit 1
     fi
 
-    IFS='|' read -r TYPE IS_MGR <<< "$PEER_DATA"
+    TYPE=$(echo "$PEER_DATA" | cut -d'|' -f1)
+    IS_MGR=$(echo "$PEER_DATA" | cut -d'|' -f2)
 
     if [ "$IS_MGR" == "1" ]; then
         echo -e "${RED}Error: Cannot remove the Manager node.${NC}"
@@ -242,12 +246,21 @@ sync_mesh() {
     SERVER_IDS=$(sqlite3 "$DB_FILE" "SELECT id FROM peers WHERE peer_type='server';")
 
     for ID in $SERVER_IDS; do
-        IFS='|' read -r T_NAME T_VPN T_REAL T_MGR <<< $(sqlite3 -separator "|" "$DB_FILE" "SELECT hostname, vpn_ip, endpoint_ip, is_manager FROM peers WHERE id=$ID")
+        DATA=$(sqlite3 -separator "|" "$DB_FILE" "SELECT hostname, vpn_ip, endpoint_ip, is_manager FROM peers WHERE id=$ID")
+        T_NAME=$(echo "$DATA" | cut -d'|' -f1)
+        T_VPN=$(echo "$DATA" | cut -d'|' -f2)
+        T_REAL=$(echo "$DATA" | cut -d'|' -f3)
+        T_MGR=$(echo "$DATA" | cut -d'|' -f4)
 
         PEER_BLOCKS=""
         OTHER_IDS=$(sqlite3 "$DB_FILE" "SELECT id FROM peers WHERE id != $ID;")
         for O_ID in $OTHER_IDS; do
-            IFS='|' read -r O_PUB O_VPN O_REAL O_PORT O_TYPE <<< $(sqlite3 -separator "|" "$DB_FILE" "SELECT public_key, vpn_ip, endpoint_ip, listen_port, peer_type FROM peers WHERE id=$O_ID")
+            DATA=$(sqlite3 -separator "|" "$DB_FILE" "SELECT public_key, vpn_ip, endpoint_ip, listen_port, peer_type FROM peers WHERE id=$O_ID")
+            O_PUB=$(echo "$DATA" | cut -d'|' -f1)
+            O_VPN=$(echo "$DATA" | cut -d'|' -f2)
+            O_REAL=$(echo "$DATA" | cut -d'|' -f3)
+            O_PORT=$(echo "$DATA" | cut -d'|' -f4)
+            O_TYPE=$(echo "$DATA" | cut -d'|' -f5)
 
             if [ "$O_TYPE" == "client" ]; then
                 BLOCK="[Peer]
@@ -328,8 +341,7 @@ upgrade_system() {
     TARGET=$1
     check_root
     if [ "$TARGET" == "all" ]; then
-        sqlite3 -separator "|" "$DB_FILE" "SELECT hostname, endpoint_ip, is_manager FROM peers WHERE peer_type='server'" | while read -r line; do
-            IFS='|' read -r NAME REAL MGR <<< "$line"
+        sqlite3 -separator "|" "$DB_FILE" "SELECT hostname, endpoint_ip, is_manager FROM peers WHERE peer_type='server'" | while IFS='|' read -r NAME REAL MGR; do
             read -p "Upgrade '$NAME'? (y/n/q): " -n 1 -r; echo
             if [[ $REPLY =~ ^[Qq]$ ]]; then exit 0; fi
             if [[ $REPLY =~ ^[Yy]$ ]]; then perform_upgrade "$NAME" "$REAL" "$MGR"; fi
@@ -337,7 +349,9 @@ upgrade_system() {
     else
         RAW=$(sqlite3 -separator "|" "$DB_FILE" "SELECT hostname, endpoint_ip, is_manager FROM peers WHERE hostname='$TARGET'")
         if [[ -z "$RAW" ]]; then echo "Node not found."; exit 1; fi
-        IFS='|' read -r NAME REAL MGR <<< "$RAW"
+        NAME=$(echo "$RAW" | cut -d'|' -f1)
+        REAL=$(echo "$RAW" | cut -d'|' -f2)
+        MGR=$(echo "$RAW" | cut -d'|' -f3)
         perform_upgrade "$NAME" "$REAL" "$MGR"
     fi
 }
@@ -350,8 +364,7 @@ list_peers() {
     echo "-----------------------------------------------------------------------------"
     DUMP=$(wg show $WG_IFACE dump)
     NOW=$(date +%s)
-    sqlite3 -separator "|" "$DB_FILE" "SELECT hostname, vpn_ip, endpoint_ip, public_key, peer_type FROM peers" | while read -r line; do
-        IFS='|' read -r NAME VPN REAL PUB TYPE <<< "$line"
+    sqlite3 -separator "|" "$DB_FILE" "SELECT hostname, vpn_ip, endpoint_ip, public_key, peer_type FROM peers" | while IFS='|' read -r NAME VPN REAL PUB TYPE; do
 
         STATS=$(echo "$DUMP" | grep "$PUB")
         STATUS="${RED}OFFLINE${NC}"; SEEN="-"
