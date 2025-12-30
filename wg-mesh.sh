@@ -28,7 +28,7 @@ ensure_deps() {
         echo -e "${YELLOW}Installing dependencies...${NC}"
         apt-get update && apt-get install -y wireguard sqlite3 bc ufw curl
     fi
-
+    # ENABLE IP FORWARDING
     if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf; then
         echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
         sysctl -p
@@ -91,7 +91,7 @@ init_manager() {
     sqlite3 "$DB_FILE" "INSERT INTO peers (hostname, vpn_ip, public_key, endpoint_ip, listen_port, peer_type, is_manager)
         VALUES ('manager', '${VPN_SUBNET}.1', '${PUB_KEY}', '${MGMT_ENDPOINT}', ${DEFAULT_PORT}, 'server', 1);"
 
-    # ADDED POSTUP RULES FOR NAT (Fixes routing issues)
+    # POSTUP RULES FOR NAT
     cat > "$CONFIG_DIR/$WG_IFACE.conf" <<EOF
 [Interface]
 Address = ${VPN_SUBNET}.1/24
@@ -146,7 +146,6 @@ add_node() {
         ufw allow ${DEFAULT_PORT}/udp
         ufw allow in on ${WG_IFACE}
         echo 'y' | ufw enable
-        # Enable Forwarding on Worker too
         if ! grep -q 'net.ipv4.ip_forward=1' /etc/sysctl.conf; then echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf; sysctl -p; fi
     "
     ssh -o StrictHostKeyChecking=no $REMOTE_USER_HOST "$SETUP_CMD"
@@ -200,7 +199,6 @@ add_client() {
     sqlite3 "$DB_FILE" "INSERT INTO peers (hostname, vpn_ip, public_key, private_key, endpoint_ip, listen_port, peer_type, is_manager)
         VALUES ('$CLIENT_NAME', '$CLIENT_IP', '$PUB_KEY', '$PRIV_KEY', 'dynamic', 0, 'client', 0);"
 
-    # Removed Output Suppression to verify Sync works
     sync_mesh
     export_client "$CLIENT_NAME"
 }
@@ -242,7 +240,7 @@ export_client() {
 }
 
 # ==========================================
-# SYNC MESH
+# SYNC MESH (FIXED NEWLINES)
 # ==========================================
 sync_mesh() {
     echo -e "${GREEN}Syncing Mesh...${NC}"
@@ -256,19 +254,18 @@ sync_mesh() {
         for O_ID in $OTHER_IDS; do
             IFS='|' read -r O_PUB O_VPN O_REAL O_PORT O_TYPE <<< $(sqlite3 -separator "|" "$DB_FILE" "SELECT public_key, vpn_ip, endpoint_ip, listen_port, peer_type FROM peers WHERE id=$O_ID")
 
+            # Use printf -v to assign to variable PRESERVING newlines
             if [ "$O_TYPE" == "client" ]; then
-                BLOCK=$(printf "[Peer]\n# Client: Peer_%s\nPublicKey = %s\nAllowedIPs = %s/32\n" "$O_ID" "$O_PUB" "$O_VPN")
+                printf -v BLOCK "[Peer]\n# Client: Peer_%s\nPublicKey = %s\nAllowedIPs = %s/32\n" "$O_ID" "$O_PUB" "$O_VPN"
             else
                 if [[ "$O_REAL" == *":"* ]]; then EP="[$O_REAL]:$O_PORT"; else EP="$O_REAL:$O_PORT"; fi
-                BLOCK=$(printf "[Peer]\n# Server: Peer_%s\nPublicKey = %s\nEndpoint = %s\nAllowedIPs = %s/32\nPersistentKeepalive = 25\n" "$O_ID" "$O_PUB" "$EP" "$O_VPN")
+                printf -v BLOCK "[Peer]\n# Server: Peer_%s\nPublicKey = %s\nEndpoint = %s\nAllowedIPs = %s/32\nPersistentKeepalive = 25\n" "$O_ID" "$O_PUB" "$EP" "$O_VPN"
             fi
-            PEER_BLOCKS="${PEER_BLOCKS}${BLOCK}"
+            PEER_BLOCKS+="$BLOCK"
         done
 
         if [ "$T_NAME" == "manager" ]; then
-            # MANAGER CONFIG
             CUR_KEY=$(grep "PrivateKey" $CONFIG_DIR/$WG_IFACE.conf | awk '{print $3}')
-            # RE-ADD POSTUP RULES during Sync to ensure they persist
             cat > "$CONFIG_DIR/$WG_IFACE.conf" <<EOF
 [Interface]
 Address = $T_VPN/24
@@ -282,7 +279,6 @@ $PEER_BLOCKS
 EOF
             wg syncconf $WG_IFACE <(wg-quick strip $WG_IFACE)
         else
-            # SERVER CONFIG (No NAT needed on workers usually, but doesn't hurt)
             ssh -o StrictHostKeyChecking=no root@$T_REAL "
                 CUR_KEY=\$(grep 'PrivateKey' /etc/wireguard/wg0.conf | awk '{print \$3}')
                 cat > /etc/wireguard/wg0.conf <<EOF_CONF
