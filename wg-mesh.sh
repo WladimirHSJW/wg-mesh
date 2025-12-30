@@ -3,7 +3,7 @@
 # ==========================================
 # CONFIGURATION
 # ==========================================
-# Detect IPs at runtime for firewall whitelisting
+# Detect IPs at runtime
 MGMT_IPV4=$(curl -4 -s ifconfig.me)
 MGMT_IPV6=$(curl -6 -s ifconfig.me)
 
@@ -207,11 +207,22 @@ export_client() {
     if [[ -z "$DATA" ]]; then echo "Client '$CLIENT_NAME' not found."; exit 1; fi
 
     IFS='|' read -r PRIV IP <<< "$DATA"
-    MGR_DATA=$(sqlite3 -separator "|" "$DB_FILE" "SELECT public_key, endpoint_ip, listen_port FROM peers WHERE is_manager=1")
-    IFS='|' read -r M_PUB M_IP M_PORT <<< "$MGR_DATA"
 
-    # Wrap Manager IP in brackets if IPv6
-    if [[ "$M_IP" == *":"* ]]; then M_EP="[$M_IP]:$M_PORT"; else M_EP="$M_IP:$M_PORT"; fi
+    # Get Public Key and Port from DB
+    MGR_DATA=$(sqlite3 -separator "|" "$DB_FILE" "SELECT public_key, listen_port FROM peers WHERE is_manager=1")
+    IFS='|' read -r M_PUB M_PORT <<< "$MGR_DATA"
+
+    # FORCE IPV4 DETECTION FOR CLIENT EXPORT
+    # Even if DB has IPv6, clients prefer IPv4 for compatibility
+    CURRENT_V4=$(curl -4 -s ifconfig.me)
+
+    if [ -n "$CURRENT_V4" ]; then
+        M_EP="$CURRENT_V4:$M_PORT"
+    else
+        # Fallback to DB endpoint (likely IPv6)
+        DB_EP=$(sqlite3 "$DB_FILE" "SELECT endpoint_ip FROM peers WHERE is_manager=1")
+        if [[ "$DB_EP" == *":"* ]]; then M_EP="[$DB_EP]:$M_PORT"; else M_EP="$DB_EP:$M_PORT"; fi
+    fi
 
     echo ""
     echo -e "${GREEN}### COPY BELOW FOR WIREGUARD CLIENT ($CLIENT_NAME) ###${NC}"
@@ -299,7 +310,6 @@ PrivateKey = \$CUR_KEY
 SaveConfig = false
 $PEER_BLOCKS
 EOF_CONF
-                # START OR SYNC LOGIC
                 systemctl enable wg-quick@wg0
                 if systemctl is-active --quiet wg-quick@wg0; then
                     wg syncconf wg0 <(wg-quick strip wg0)
