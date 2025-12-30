@@ -3,7 +3,10 @@
 # ==========================================
 # CONFIGURATION
 # ==========================================
-MGMT_ENDPOINT="$(curl -s ifconfig.me)"
+# DETECT BOTH IPV4 AND IPV6 TO PREVENT LOCKOUTS
+MGMT_IPV4=$(curl -4 -s ifconfig.me)
+MGMT_IPV6=$(curl -6 -s ifconfig.me)
+
 DEFAULT_PORT="51820"
 VPN_SUBNET="10.10.0"
 WG_IFACE="wg0"
@@ -61,6 +64,8 @@ init_manager() {
     if [ "$EXISTS" -gt 0 ]; then echo "Manager already in DB."; return; fi
 
     echo -e "${GREEN}Initializing Mesh Manager...${NC}"
+    echo "Detected Manager IPs - IPv4: $MGMT_IPV4 | IPv6: $MGMT_IPV6"
+
     umask 077
     PRIV_KEY=$(wg genkey)
     PUB_KEY=$(echo "$PRIV_KEY" | wg pubkey)
@@ -72,6 +77,9 @@ init_manager() {
     ufw allow ${DEFAULT_PORT}/udp
     ufw allow in on ${WG_IFACE}
     echo "y" | ufw enable
+
+    # Prefer IPv4 for the database endpoint if available, else IPv6
+    MGMT_ENDPOINT=${MGMT_IPV4:-$MGMT_IPV6}
 
     sqlite3 "$DB_FILE" "INSERT INTO peers (hostname, vpn_ip, public_key, endpoint_ip, listen_port, peer_type, is_manager)
         VALUES ('manager', '${VPN_SUBNET}.1', '${PUB_KEY}', '${MGMT_ENDPOINT}', ${DEFAULT_PORT}, 'server', 1);"
@@ -109,16 +117,24 @@ add_node() {
     LAST_IP=$(sqlite3 "$DB_FILE" "SELECT MAX(id) FROM peers;")
     NODE_VPN_IP="${VPN_SUBNET}.$((LAST_IP + 1))"
 
-    echo -e "${BLUE}Step 1/3: Installing software on $NODE_NAME...${NC}"
+    echo -e "${BLUE}Step 1/3: Installing & Securing $NODE_NAME...${NC}"
 
-    # 1. INSTALLATION (Noisy output ignored)
+    # Build the Firewall Rule String dynamically based on what IPs we detected
+    FW_RULES=""
+    if [ -n "$MGMT_IPV4" ]; then FW_RULES+="ufw allow from $MGMT_IPV4 to any port 22 proto tcp;"; fi
+    if [ -n "$MGMT_IPV6" ]; then FW_RULES+="ufw allow from $MGMT_IPV6 to any port 22 proto tcp;"; fi
+
+    # 1. INSTALLATION
     SETUP_CMD="
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq && apt-get install -y ufw wireguard curl -qq
         ufw --force reset
         ufw default deny incoming
         ufw default allow outgoing
-        ufw allow from $MGMT_ENDPOINT to any port 22 proto tcp
+
+        # Apply generated rules for Manager Access
+        $FW_RULES
+
         ufw allow 80/tcp
         ufw allow 443/tcp
         ufw allow ${DEFAULT_PORT}/udp
@@ -126,29 +142,24 @@ add_node() {
         echo 'y' | ufw enable
     "
     ssh -o StrictHostKeyChecking=no $REMOTE_USER_HOST "$SETUP_CMD"
-    if [ $? -ne 0 ]; then echo -e "${RED}Installation failed on remote.${NC}"; exit 1; fi
+    if [ $? -ne 0 ]; then echo -e "${RED}Installation/Firewall setup failed.${NC}"; exit 1; fi
 
-    # 2. GENERATE KEYS & GET INFO (Clean output)
+    # 2. GENERATE KEYS
     echo -e "${BLUE}Step 2/3: Generating keys...${NC}"
     DATA_CMD="
-        # Generate Keypair
         PRIV=\$(wg genkey)
         PUB=\$(echo \"\$PRIV\" | wg pubkey)
 
-        # Save Private Key immediately so it persists for sync_mesh
-        # We create a partial config file
         mkdir -p /etc/wireguard
         echo \"[Interface]\" > /etc/wireguard/wg0.conf
         echo \"PrivateKey = \$PRIV\" >> /etc/wireguard/wg0.conf
         chmod 600 /etc/wireguard/wg0.conf
 
-        # Output info for Manager with delimiters
         echo \"MATCH_PUB:\$PUB\"
         echo \"MATCH_IP:\$(curl -s ifconfig.me)\"
     "
     REMOTE_DATA=$(ssh -o StrictHostKeyChecking=no $REMOTE_USER_HOST "$DATA_CMD")
 
-    # Parse using delimiters to avoid noise
     PUB=$(echo "$REMOTE_DATA" | grep "MATCH_PUB:" | cut -d':' -f2 | tr -d '\r')
     DETECTED_IP=$(echo "$REMOTE_DATA" | grep "MATCH_IP:" | cut -d':' -f2 | tr -d '\r')
     ENDPOINT=${MANUAL_ENDPOINT:-$DETECTED_IP}
@@ -167,7 +178,7 @@ add_node() {
 }
 
 # ==========================================
-# ADD CLIENT (Laptop/Phone)
+# ADD CLIENT
 # ==========================================
 add_client() {
     CLIENT_NAME=$1
@@ -276,7 +287,6 @@ $PEER_BLOCKS
 EOF
             wg syncconf $WG_IFACE <(wg-quick strip $WG_IFACE)
         else
-            # We assume wg0.conf exists and has PrivateKey because add_node created it
             ssh -o StrictHostKeyChecking=no root@$T_REAL "
                 CUR_KEY=\$(grep 'PrivateKey' /etc/wireguard/wg0.conf | awk '{print \$3}')
                 cat > /etc/wireguard/wg0.conf <<EOF_CONF
