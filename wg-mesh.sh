@@ -28,13 +28,9 @@ ensure_deps() {
         echo -e "${YELLOW}Installing dependencies...${NC}"
         apt-get update && apt-get install -y wireguard sqlite3 bc ufw curl
     fi
-    # ENABLE IP FORWARDING
+    # ENABLE IP FORWARDING (Required for Split Tunneling to reach other nodes/containers)
     if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf; then
         echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-        sysctl -p
-    fi
-    if ! grep -q "net.ipv6.conf.all.forwarding=1" /etc/sysctl.conf; then
-        echo "net.ipv6.conf.all.forwarding=1" >> /etc/sysctl.conf
         sysctl -p
     fi
 }
@@ -91,23 +87,22 @@ init_manager() {
     sqlite3 "$DB_FILE" "INSERT INTO peers (hostname, vpn_ip, public_key, endpoint_ip, listen_port, peer_type, is_manager)
         VALUES ('manager', '${VPN_SUBNET}.1', '${PUB_KEY}', '${MGMT_ENDPOINT}', ${DEFAULT_PORT}, 'server', 1);"
 
-    # APPLY DOCKER COMPATIBLE ROUTING RULES
+    # SIMPLE SPLIT TUNNEL CONFIG WITH DOCKER FIX
     cat > "$CONFIG_DIR/$WG_IFACE.conf" <<EOF
 [Interface]
 Address = ${VPN_SUBNET}.1/24
 ListenPort = ${DEFAULT_PORT}
 PrivateKey = ${PRIV_KEY}
 SaveConfig = false
-# 1. Allow UFW routing
-PostUp = ufw route allow in on $WG_IFACE out on eth0
-# 2. Standard Masquerade for Internet access via VPN
-PostUp = iptables -A FORWARD -i $WG_IFACE -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
-# 3. DOCKER FIX: Allow VPN traffic to reach Docker containers
-PostUp = iptables -I DOCKER-USER -i $WG_IFACE -j ACCEPT 2>/dev/null || true; iptables -I DOCKER-USER -o $WG_IFACE -j ACCEPT 2>/dev/null || true
 
-# Cleanup on Down
-PostDown = iptables -D FORWARD -i $WG_IFACE -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
-PostDown = iptables -D DOCKER-USER -i $WG_IFACE -j ACCEPT 2>/dev/null || true; iptables -D DOCKER-USER -o $WG_IFACE -j ACCEPT 2>/dev/null || true
+# 1. Allow VPN traffic to flow
+PostUp = ufw route allow in on $WG_IFACE out on eth0
+
+# 2. DOCKER COMPATIBILITY (The "Fix")
+# This Masquerades traffic coming FROM the VPN so Docker containers know where to reply.
+# It does NOT route your internet traffic, only VPN traffic accessing the server.
+PostUp = iptables -t nat -A POSTROUTING -s ${VPN_SUBNET}.0/24 -j MASQUERADE
+PostDown = iptables -t nat -D POSTROUTING -s ${VPN_SUBNET}.0/24 -j MASQUERADE
 EOF
 
     systemctl enable wg-quick@$WG_IFACE
@@ -153,6 +148,7 @@ add_node() {
         ufw allow ${DEFAULT_PORT}/udp
         ufw allow in on ${WG_IFACE}
         echo 'y' | ufw enable
+        # Forwarding needed for mesh routing
         if ! grep -q 'net.ipv4.ip_forward=1' /etc/sysctl.conf; then echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf; sysctl -p; fi
     "
     ssh -o StrictHostKeyChecking=no $REMOTE_USER_HOST "$SETUP_CMD"
@@ -240,6 +236,7 @@ export_client() {
     echo "# Manager connection"
     echo "PublicKey = $M_PUB"
     echo "Endpoint = $M_EP"
+    # STRICT SPLIT TUNNELING: Only traffic for 10.10.0.x goes through VPN
     echo "AllowedIPs = ${VPN_SUBNET}.0/24"
     echo "PersistentKeepalive = 25"
     echo "---------------------------------------------------------"
@@ -247,19 +244,16 @@ export_client() {
 }
 
 # ==========================================
-# SYNC MESH (WITH DOCKER RULES FOR EVERYONE)
+# SYNC MESH
 # ==========================================
 sync_mesh() {
     echo -e "${GREEN}Syncing Mesh...${NC}"
     SERVER_IDS=$(sqlite3 "$DB_FILE" "SELECT id FROM peers WHERE peer_type='server';")
 
-    # Define the Docker-Compatible PostUp Rules
-    RULES_UP="PostUp = ufw route allow in on $WG_IFACE out on eth0\n"
-    RULES_UP+="PostUp = iptables -A FORWARD -i $WG_IFACE -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE\n"
-    RULES_UP+="PostUp = iptables -I DOCKER-USER -i $WG_IFACE -j ACCEPT 2>/dev/null || true; iptables -I DOCKER-USER -o $WG_IFACE -j ACCEPT 2>/dev/null || true"
-
-    RULES_DOWN="PostDown = iptables -D FORWARD -i $WG_IFACE -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE\n"
-    RULES_DOWN+="PostDown = iptables -D DOCKER-USER -i $WG_IFACE -j ACCEPT 2>/dev/null || true; iptables -D DOCKER-USER -o $WG_IFACE -j ACCEPT 2>/dev/null || true"
+    # CLEANER RULES FOR SPLIT TUNNEL + DOCKER SUPPORT
+    # We masquerade VPN traffic so Docker accepts it.
+    RULES_UP="PostUp = iptables -t nat -A POSTROUTING -s ${VPN_SUBNET}.0/24 -j MASQUERADE"
+    RULES_DOWN="PostDown = iptables -t nat -D POSTROUTING -s ${VPN_SUBNET}.0/24 -j MASQUERADE"
 
     for ID in $SERVER_IDS; do
         IFS='|' read -r T_NAME T_VPN T_REAL T_MGR <<< $(sqlite3 -separator "|" "$DB_FILE" "SELECT hostname, vpn_ip, endpoint_ip, is_manager FROM peers WHERE id=$ID")
@@ -278,7 +272,6 @@ sync_mesh() {
             PEER_BLOCKS+="$BLOCK"
         done
 
-        # CONFIG CONTENT with RULES injected
         CONFIG_CONTENT="[Interface]\nAddress = $T_VPN/24\nListenPort = ${DEFAULT_PORT}\nPrivateKey = PRIV_KEY_PLACEHOLDER\nSaveConfig = false\n$RULES_UP\n$RULES_DOWN\n$PEER_BLOCKS"
 
         if [ "$T_NAME" == "manager" ]; then
@@ -286,14 +279,10 @@ sync_mesh() {
             echo -e "${CONFIG_CONTENT/PRIV_KEY_PLACEHOLDER/$CUR_KEY}" > "$CONFIG_DIR/$WG_IFACE.conf"
             wg syncconf $WG_IFACE <(wg-quick strip $WG_IFACE)
         else
-            # ESCAPE variables for SSH heredoc
-            REMOTE_CONFIG="${CONFIG_CONTENT//\\n/\\\\n}" # Escape newlines for remote echo
-
+            REMOTE_CONFIG="${CONFIG_CONTENT//\\n/\\\\n}"
             ssh -o StrictHostKeyChecking=no root@$T_REAL "
                 CUR_KEY=\$(grep 'PrivateKey' /etc/wireguard/wg0.conf | awk '{print \$3}')
-                # Write config using the remote key
                 echo -e \"${REMOTE_CONFIG/PRIV_KEY_PLACEHOLDER/\$CUR_KEY}\" > /etc/wireguard/wg0.conf
-
                 systemctl enable wg-quick@wg0
                 if systemctl is-active --quiet wg-quick@wg0; then wg syncconf wg0 <(wg-quick strip wg0); else systemctl start wg-quick@wg0; fi
             "
