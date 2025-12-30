@@ -109,12 +109,12 @@ add_node() {
     LAST_IP=$(sqlite3 "$DB_FILE" "SELECT MAX(id) FROM peers;")
     NODE_VPN_IP="${VPN_SUBNET}.$((LAST_IP + 1))"
 
-    echo -e "${BLUE}Provisioning Server: $NODE_NAME ($NODE_VPN_IP)...${NC}"
+    echo -e "${BLUE}Step 1/3: Installing software on $NODE_NAME...${NC}"
 
-    # Remote Setup & Firewall
-    REMOTE_CMD="
+    # 1. INSTALLATION (Noisy output ignored)
+    SETUP_CMD="
         export DEBIAN_FRONTEND=noninteractive
-        apt-get update -qq && apt-get install -y ufw wireguard -qq
+        apt-get update -qq && apt-get install -y ufw wireguard curl -qq
         ufw --force reset
         ufw default deny incoming
         ufw default allow outgoing
@@ -124,26 +124,45 @@ add_node() {
         ufw allow ${DEFAULT_PORT}/udp
         ufw allow in on ${WG_IFACE}
         echo 'y' | ufw enable
-        wg genkey | tee /tmp/privkey | wg pubkey
-        cat /tmp/privkey
-        rm /tmp/privkey
-        curl -s ifconfig.me
     "
-    REMOTE_DATA=$(ssh -o StrictHostKeyChecking=no $REMOTE_USER_HOST "$REMOTE_CMD")
-    if [ $? -ne 0 ]; then echo -e "${RED}SSH Failed.${NC}"; exit 1; fi
+    ssh -o StrictHostKeyChecking=no $REMOTE_USER_HOST "$SETUP_CMD"
+    if [ $? -ne 0 ]; then echo -e "${RED}Installation failed on remote.${NC}"; exit 1; fi
 
-    PUB=$(echo "$REMOTE_DATA" | grep -oP '^[A-Za-z0-9+/]{42}[=]{0,2}$' | head -n 1)
-    DETECTED_IP=$(echo "$REMOTE_DATA" | tail -n 1)
+    # 2. GENERATE KEYS & GET INFO (Clean output)
+    echo -e "${BLUE}Step 2/3: Generating keys...${NC}"
+    DATA_CMD="
+        # Generate Keypair
+        PRIV=\$(wg genkey)
+        PUB=\$(echo \"\$PRIV\" | wg pubkey)
+
+        # Save Private Key immediately so it persists for sync_mesh
+        # We create a partial config file
+        mkdir -p /etc/wireguard
+        echo \"[Interface]\" > /etc/wireguard/wg0.conf
+        echo \"PrivateKey = \$PRIV\" >> /etc/wireguard/wg0.conf
+        chmod 600 /etc/wireguard/wg0.conf
+
+        # Output info for Manager with delimiters
+        echo \"MATCH_PUB:\$PUB\"
+        echo \"MATCH_IP:\$(curl -s ifconfig.me)\"
+    "
+    REMOTE_DATA=$(ssh -o StrictHostKeyChecking=no $REMOTE_USER_HOST "$DATA_CMD")
+
+    # Parse using delimiters to avoid noise
+    PUB=$(echo "$REMOTE_DATA" | grep "MATCH_PUB:" | cut -d':' -f2 | tr -d '\r')
+    DETECTED_IP=$(echo "$REMOTE_DATA" | grep "MATCH_IP:" | cut -d':' -f2 | tr -d '\r')
     ENDPOINT=${MANUAL_ENDPOINT:-$DETECTED_IP}
 
     if [[ -z "$PUB" ]]; then
-        echo -e "${RED}Failed to extract public key from remote.${NC}"
+        echo -e "${RED}Failed to extract keys. Raw output below:${NC}"
+        echo "$REMOTE_DATA"
         exit 1
     fi
 
     sqlite3 "$DB_FILE" "INSERT INTO peers (hostname, vpn_ip, public_key, endpoint_ip, listen_port, peer_type, is_manager)
         VALUES ('$NODE_NAME', '$NODE_VPN_IP', '$PUB', '$ENDPOINT', ${DEFAULT_PORT}, 'server', 0);"
 
+    echo -e "${BLUE}Step 3/3: Syncing Mesh...${NC}"
     sync_mesh
 }
 
@@ -169,8 +188,7 @@ add_client() {
     sqlite3 "$DB_FILE" "INSERT INTO peers (hostname, vpn_ip, public_key, private_key, endpoint_ip, listen_port, peer_type, is_manager)
         VALUES ('$CLIENT_NAME', '$CLIENT_IP', '$PUB_KEY', '$PRIV_KEY', 'dynamic', 0, 'client', 0);"
 
-    sync_mesh > /dev/null 2>&1 # Sync in background to not block output
-
+    sync_mesh > /dev/null 2>&1
     export_client "$CLIENT_NAME"
 }
 
@@ -182,7 +200,6 @@ export_client() {
     if [[ -z "$DATA" ]]; then echo "Client '$CLIENT_NAME' not found."; exit 1; fi
 
     IFS='|' read -r PRIV IP <<< "$DATA"
-
     MGR_DATA=$(sqlite3 -separator "|" "$DB_FILE" "SELECT public_key, endpoint_ip, listen_port FROM peers WHERE is_manager=1")
     IFS='|' read -r M_PUB M_IP M_PORT <<< "$MGR_DATA"
 
@@ -195,7 +212,7 @@ export_client() {
     echo "DNS = 1.1.1.1"
     echo ""
     echo "[Peer]"
-    echo "# Manager connection (for access to the whole mesh)"
+    echo "# Manager connection"
     echo "PublicKey = $M_PUB"
     echo "Endpoint = $M_IP:$M_PORT"
     echo "AllowedIPs = ${VPN_SUBNET}.0/24"
@@ -205,37 +222,23 @@ export_client() {
 }
 
 # ==========================================
-# REMOVE PEER (Server or Client)
+# REMOVE PEER
 # ==========================================
 remove_peer() {
     TARGET=$1
     if [[ -z "$TARGET" ]]; then echo "Usage: $0 remove <name>"; exit 1; fi
     check_root
 
-    # Get Peer details before deletion
     PEER_DATA=$(sqlite3 -separator "|" "$DB_FILE" "SELECT peer_type, is_manager FROM peers WHERE hostname='$TARGET';")
-
-    if [[ -z "$PEER_DATA" ]]; then
-        echo -e "${RED}Error: Peer '$TARGET' not found in database.${NC}"
-        exit 1
-    fi
+    if [[ -z "$PEER_DATA" ]]; then echo -e "${RED}Error: Peer '$TARGET' not found.${NC}"; exit 1; fi
 
     IFS='|' read -r TYPE IS_MGR <<< "$PEER_DATA"
-
-    if [ "$IS_MGR" == "1" ]; then
-        echo -e "${RED}Error: Cannot remove the Manager node.${NC}"
-        exit 1
-    fi
+    if [ "$IS_MGR" == "1" ]; then echo -e "${RED}Error: Cannot remove the Manager node.${NC}"; exit 1; fi
 
     echo -e "${YELLOW}Removing $TYPE: $TARGET...${NC}"
-
-    # Delete from DB
     sqlite3 "$DB_FILE" "DELETE FROM peers WHERE hostname='$TARGET';"
-
-    # Sync remaining nodes to drop the keys/connection
     sync_mesh
-
-    echo -e "${GREEN}Successfully removed $TARGET. Access revoked.${NC}"
+    echo -e "${GREEN}Successfully removed $TARGET.${NC}"
 }
 
 # ==========================================
@@ -254,11 +257,9 @@ sync_mesh() {
             IFS='|' read -r O_PUB O_VPN O_REAL O_PORT O_TYPE <<< $(sqlite3 -separator "|" "$DB_FILE" "SELECT public_key, vpn_ip, endpoint_ip, listen_port, peer_type FROM peers WHERE id=$O_ID")
 
             if [ "$O_TYPE" == "client" ]; then
-                BLOCK=$(printf "[Peer]\n# Client: Peer_%s\nPublicKey = %s\nAllowedIPs = %s/32\n" \
-                    "$O_ID" "$O_PUB" "$O_VPN")
+                BLOCK=$(printf "[Peer]\n# Client: Peer_%s\nPublicKey = %s\nAllowedIPs = %s/32\n" "$O_ID" "$O_PUB" "$O_VPN")
             else
-                BLOCK=$(printf "[Peer]\n# Server: Peer_%s\nPublicKey = %s\nEndpoint = %s:%s\nAllowedIPs = %s/32\nPersistentKeepalive = 25\n" \
-                    "$O_ID" "$O_PUB" "$O_REAL" "$O_PORT" "$O_VPN")
+                BLOCK=$(printf "[Peer]\n# Server: Peer_%s\nPublicKey = %s\nEndpoint = %s:%s\nAllowedIPs = %s/32\nPersistentKeepalive = 25\n" "$O_ID" "$O_PUB" "$O_REAL" "$O_PORT" "$O_VPN")
             fi
             PEER_BLOCKS="${PEER_BLOCKS}${BLOCK}"
         done
@@ -275,8 +276,9 @@ $PEER_BLOCKS
 EOF
             wg syncconf $WG_IFACE <(wg-quick strip $WG_IFACE)
         else
+            # We assume wg0.conf exists and has PrivateKey because add_node created it
             ssh -o StrictHostKeyChecking=no root@$T_REAL "
-                if [ -f /etc/wireguard/wg0.conf ]; then CUR_KEY=\$(grep 'PrivateKey' /etc/wireguard/wg0.conf | awk '{print \$3}'); else CUR_KEY=\$(wg genkey); fi
+                CUR_KEY=\$(grep 'PrivateKey' /etc/wireguard/wg0.conf | awk '{print \$3}')
                 cat > /etc/wireguard/wg0.conf <<EOF_CONF
 [Interface]
 Address = $T_VPN/24
@@ -296,16 +298,12 @@ EOF_CONF
 # UPGRADE
 # ==========================================
 perform_upgrade() {
-    TARGET_NAME=$1
-    TARGET_IP=$2
-    IS_LOCAL=$3
+    TARGET_NAME=$1; TARGET_IP=$2; IS_LOCAL=$3
     echo -e "${BLUE}>>> Upgrade: $TARGET_NAME${NC}"
     CMD="export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get upgrade -y"
     CHECK="[ -f /var/run/reboot-required ] && echo 'REBOOT_NEEDED' || echo 'NO_REBOOT'"
 
-    if [ "$IS_LOCAL" == "1" ]; then
-        eval "$CMD"; RES=$(eval "$CHECK")
-    else
+    if [ "$IS_LOCAL" == "1" ]; then eval "$CMD"; RES=$(eval "$CHECK"); else
         ssh -o StrictHostKeyChecking=no root@$TARGET_IP "$CMD"
         RES=$(ssh -o StrictHostKeyChecking=no root@$TARGET_IP "$CHECK")
     fi
@@ -320,8 +318,7 @@ perform_upgrade() {
 }
 
 upgrade_system() {
-    TARGET=$1
-    check_root
+    TARGET=$1; check_root
     if [ "$TARGET" == "all" ]; then
         sqlite3 -separator "|" "$DB_FILE" "SELECT hostname, endpoint_ip, is_manager FROM peers WHERE peer_type='server'" | while read -r line; do
             IFS='|' read -r NAME REAL MGR <<< "$line"
@@ -347,20 +344,15 @@ list_peers() {
     NOW=$(date +%s)
     sqlite3 -separator "|" "$DB_FILE" "SELECT hostname, vpn_ip, endpoint_ip, public_key, peer_type FROM peers" | while read -r line; do
         IFS='|' read -r NAME VPN REAL PUB TYPE <<< "$line"
-
         STATS=$(echo "$DUMP" | grep "$PUB")
         STATUS="${RED}OFFLINE${NC}"; SEEN="-"
         if [ ! -z "$STATS" ]; then
             HS=$(echo "$STATS" | awk '{print $5}')
-            # --- FIX APPLIED HERE ---
-            # Check if HS is a number and not 0 before performing arithmetic
             if [[ "$HS" =~ ^[0-9]+$ ]] && [ "$HS" -ne 0 ]; then
                 if [ $((NOW - HS)) -lt 180 ]; then STATUS="${GREEN}ONLINE${NC}"; else STATUS="${YELLOW}IDLE${NC}"; fi
                 SEEN=$(date -d @$HS "+%H:%M:%S")
             else
-                # If handshake is 0 or invalid, it's offline/never connected
-                STATUS="${RED}OFFLINE${NC}"
-                SEEN="Never"
+                STATUS="${RED}OFFLINE${NC}"; SEEN="Never"
             fi
         fi
         printf "%-15s %-15s %-15s %-10s %-10b %-10s\n" "$NAME" "$VPN" "$REAL" "$TYPE" "$STATUS" "$SEEN"
