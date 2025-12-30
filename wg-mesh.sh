@@ -264,7 +264,8 @@ AllowedIPs = $O_VPN/32
 PersistentKeepalive = 25
 "
             fi
-            PEER_BLOCKS="${PEER_BLOCKS}\n${BLOCK}"
+            PEER_BLOCKS="$PEER_BLOCKS
+$BLOCK"
         done
 
         if [ "$T_NAME" == "manager" ]; then
@@ -356,6 +357,7 @@ list_peers() {
         STATUS="${RED}OFFLINE${NC}"; SEEN="-"
         if [ ! -z "$STATS" ]; then
             HS=$(echo "$STATS" | awk '{print $5}')
+            HS=${HS:-0}
             if [ "$HS" -ne 0 ]; then
                 if [ $((NOW - HS)) -lt 180 ]; then STATUS="${GREEN}ONLINE${NC}"; else STATUS="${YELLOW}IDLE${NC}"; fi
                 SEEN=$(date -d @$HS "+%H:%M:%S")
